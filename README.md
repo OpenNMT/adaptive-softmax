@@ -12,4 +12,5 @@ To use this module, clone this repository in OpenNMT/onmt/modules directory.
 
 ## License
 
-adaptive-softmax is BSD-licensed. We also provide an additional patent grant.
+adaptive-softmax is BSD-licensed. Facebook also provides an additional patent grant -
+check LICENSE and PATENT file in this diretory.

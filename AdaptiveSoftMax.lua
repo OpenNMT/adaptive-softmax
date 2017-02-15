@@ -9,21 +9,28 @@ local tablex = require 'pl.tablex'
 
 local AdaptiveSoftMax, Module = torch.class('nn.AdaptiveSoftMax', 'nn.Module')
 
-function AdaptiveSoftMax:__init(isz, cutoff)
+function AdaptiveSoftMax:__init(isz, cutoff, capacityReduction)
    Module.__init(self)
 
    self.isz    = isz
    self.cutoff = cutoff
    self.hsz    = cutoff[1] + #cutoff - 1
+   self.capacityReduction = capacityReduction or 4
 
    self.head = nn.Linear(isz, self.hsz, false)
    self.tail = {}
+   self.inputs = {}
    for i = 1, #cutoff - 1 do
-      local seq = nn.Sequential()
-      seq:add( nn.Linear(isz, isz / math.pow(4, i), false) )
-      seq:add( nn.Linear(isz / math.pow(4, i), cutoff[i+1] - cutoff[i], false) )
-      self.tail[i] = seq
+      if self.capacityReduction > 1 then
+         local seq = nn.Sequential()
+         seq:add( nn.Linear(isz, isz / math.pow(capacityReduction, i), false) )
+         seq:add( nn.Linear(isz / math.pow(capacityReduction, i), cutoff[i+1] - cutoff[i], false) )
+         self.tail[i] = seq
+      else
+         self.tail[i] = nn.Linear(isz, cutoff[i+1] - cutoff[i], false)
+      end
    end
+   self.proba = torch.Tensor(1)
    return self
 end
 
@@ -31,8 +38,12 @@ function AdaptiveSoftMax:reset(stdv)
    local stdv = stdv or 1.0 / math.sqrt(self.isz)
    self.head.weight:uniform(-stdv, stdv)
    for i = 1, #self.tail do
-      self.tail[i]:get(1).weight:uniform(-stdv, stdv)
-      self.tail[i]:get(2).weight:uniform(-stdv, stdv)
+      if self.capacityReduction > 1 then
+         self.tail[i]:get(1).weight:uniform(-stdv, stdv)
+         self.tail[i]:get(2).weight:uniform(-stdv, stdv)
+      else
+         self.tail[i].weight:uniform(-stdv, stdv)
+      end
    end
    return self
 end
@@ -59,9 +70,12 @@ function AdaptiveSoftMax:updateOutput(input)
 
    for i = 1, #self.idx do
       if torch.isTensor(self.idx[i]) then
-         self.tail[i]:updateOutput(input:index(1, self.idx[i]))
+         -- build and copy reduced input to avoid rebuilding later
+         self.inputs[i]=input:index(1, self.idx[i])
+         self.tail[i]:updateOutput(self.inputs[i])
          table.insert(self.output, self.tail[i].output)
       else
+         self.inputs[i]=nil
          table.insert(self.output, {})
       end
    end
@@ -77,7 +91,7 @@ function AdaptiveSoftMax:updateGradInput(input, gradOutput)
 
    for i = 1, #self.idx do
       if torch.isTensor(self.idx[i]) then
-         self.tail[i]:updateGradInput(input:index(1, self.idx[i]), gradOutput[i+1])
+         self.tail[i]:updateGradInput(self.inputs[i], gradOutput[i+1])
          self.gradInput:indexAdd(1, self.idx[i], self.tail[i].gradInput)
       end
    end
@@ -87,10 +101,9 @@ end
 
 function AdaptiveSoftMax:accGradParameters(input, gradOutput)
    self.head:accGradParameters(input, gradOutput[1])
-
    for i = 1, #self.idx do
       if torch.isTensor(self.idx[i]) then
-         self.tail[i]:accGradParameters(input:index(1, self.idx[i]), gradOutput[i+1])
+         self.tail[i]:accGradParameters(self.inputs[i], gradOutput[i+1])
       end
    end
 end
@@ -130,7 +143,7 @@ function AdaptiveSoftMax:getLogProb(input)
    self.head:updateOutput(input)
 
    local bsz   = self.head.output:size(1)
-   local proba = torch.zeros(bsz, self.cutoff[#self.cutoff]):cuda()
+   local proba = self.proba:resize(bsz, self.cutoff[#self.cutoff]):zero()
 
    lsm:updateOutput(self.head.output)
    proba:narrow(2, 1, self.hsz):add(lsm.output:narrow(2, 1, self.hsz))
